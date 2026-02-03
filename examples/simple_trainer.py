@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import imageio
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import tqdm
 import tyro
@@ -33,7 +34,7 @@ from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_rand
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
-from gsplat.distributed import cli
+from gsplat.distributed import all_gather_int32, cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
@@ -315,6 +316,26 @@ def create_splats_with_optimizers(
         for name, _, lr in params
     }
     return splats, optimizers
+
+
+def _gather_variable_tensor(world_size: int, tensor: Tensor) -> Tensor:
+    if world_size == 1:
+        return tensor
+    if not dist.is_initialized():
+        raise RuntimeError("Distributed process group is not initialized.")
+
+    local_n = tensor.shape[0]
+    sizes = all_gather_int32(world_size, local_n, device=tensor.device)
+    max_n = int(max(sizes))
+    if local_n < max_n:
+        pad_shape = (max_n - local_n, *tensor.shape[1:])
+        pad = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
+        tensor = torch.cat([tensor, pad], dim=0)
+
+    gathered = [torch.empty_like(tensor) for _ in range(world_size)]
+    dist.all_gather(gathered, tensor)
+    pieces = [g[: sizes[i]] for i, g in enumerate(gathered)]
+    return torch.cat(pieces, dim=0)
 
 
 class Runner:
@@ -943,16 +964,26 @@ class Runner:
                 scales = self.splats["scales"]
                 quats = self.splats["quats"]
                 opacities = self.splats["opacities"]
-                export_splats(
-                    means=means,
-                    scales=scales,
-                    quats=quats,
-                    opacities=opacities,
-                    sh0=sh0,
-                    shN=shN,
-                    format="ply",
-                    save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
-                )
+
+                if world_size > 1:
+                    means = _gather_variable_tensor(world_size, means)
+                    scales = _gather_variable_tensor(world_size, scales)
+                    quats = _gather_variable_tensor(world_size, quats)
+                    opacities = _gather_variable_tensor(world_size, opacities)
+                    sh0 = _gather_variable_tensor(world_size, sh0)
+                    shN = _gather_variable_tensor(world_size, shN)
+
+                if world_rank == 0:
+                    export_splats(
+                        means=means,
+                        scales=scales,
+                        quats=quats,
+                        opacities=opacities,
+                        sh0=sh0,
+                        shN=shN,
+                        format="ply",
+                        save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
+                    )
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
